@@ -1,208 +1,261 @@
-"""gta6-twitch-ccu-forecast-01 entry: launch-day shape transfer.
+"""GTA VI launch-day Twitch viewership forecaster (make.fun bounty).
 
-Forecasts Twitch viewers for Grand Theft Auto VI in each hour of its release
-day (2026-11-19 UTC) after hour 1, as five quantiles per hour.
+Entry point: `python3 main.py`. Reads every `*.in` case file from
+$MAKEFUN_INPUT_DIR (default /input) and writes one `<id>.out` per case to
+$MAKEFUN_OUTPUT_DIR (default /output). Python 3.13, standard library only,
+no network, fully deterministic (two runs are byte-identical).
 
-Model
------
-Every big game launch follows the same daily rhythm on Twitch: hour 1
-(00:00-01:00 UTC) is already busy because Europe and Asia-Pacific unlocked
-at their midnight, the day dips while Europe sleeps and the US has not
-unlocked yet, then it climbs into the evening as the US unlocks and the
-evening peak arrives. Instead of guessing that rhythm, this program reads
-it off the case's own `comparables`: past big launches with hourly Twitch
-counts.
+Model (v2): size-aware shape transfer from comparable launches.
+Each comparable launch contributes its launch-day shape: the ratios of its
+hourly viewers (hours 2..24) to its hour-1 print. The forecast median for
+hour h is the hour-1 print times exp(0.9 * shape_h), where shape_h is a
+robust centre of the log-ratios across a library of comparable launches.
 
-For each comparable it takes the launch day's hourly counts and forms the
-shape ratio r_h = viewers_h / viewers_1 for hours 2..24. The forecast
-median for hour h is the target's hour-1 print times the median ratio
-across the most similar launches:
+The library is chosen by the size of the target's hour-1 print (p1):
+  * Mega launch (p1 >= 300,000): a Gaussian-kernel weighted median over all
+    clean comparables, weight exp(-0.5 * ((ln p1_lib - ln p1) / 0.6) ** 2),
+    so the biggest launches dominate. Spread: the same kernel-weighted
+    standard deviation of the log-ratios per hour, 3-hour smoothed, x0.8.
+  * Otherwise: the median over size-matched comparables (hour-1 print in
+    [0.25x, 4x] of p1; if fewer than 5 match, the 8 biggest launches).
+    Spread: the per-hour standard deviation of the log-ratios in that
+    library, 3-hour smoothed, x0.75.
+Spreads are clamped to [0.10, 0.90]. Quantiles use the standard normal
+z-scores (-1.645, -0.674, 0, 0.674, 1.645) around the median.
 
-    q50(h) = p1 * exp(0.9 * median(ln r_h))
+Comparables are dropped when they are early-access contaminated (their
+launch-day shape is polluted by the early-access window) or when they are
+the GTA VI category's own pre-release series (not a launch day at all).
 
-The library is size-matched: comparables whose hour-1 print is within
-0.25x..4x of the target's, so a giant launch is compared with giant
-launches, not with small ones whose ratios explode. When fewer than five
-match, the eight biggest clean comparables are used instead.
-
-Early-access launches are left out (their launch-day shape is
-contaminated: the peak happened during early access), as is the
-Grand Theft Auto VI category's own pre-release series (a premiere, not
-a launch day).
-
-Spread
-------
-Quantiles widen with the horizon like a random walk in log space, the
-same schedule as the house baseline:
-
-    q_tau(h) = q50(h) * exp(z_tau * 0.15 * sqrt(h - 1))
-
-with z_tau the standard normal quantiles (-1.645, -0.674, 0, 0.674, 1.645).
-The spread is deliberately not fitted to the comparables: their
-cross-launch dispersion overstates how wrong the median is for one
-launch, and the pinball loss punishes a too-wide band at every hour.
-
-Validation (leave-one-out over the comparables in the practice cases,
-each launch forecast from the others, pinball loss on the log scale):
-big launches (hour-1 print >= 100k, the GTA VI-like set): 0.208 vs the
-house baseline's 0.253. All clean launches: 0.808 vs 1.137.
-
-How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0)
-in python:3.13-slim, standard library only: no network, no pip packages.
--P keeps this file's directory OFF sys.path, so a module shipped beside
-main.py imports only after the sys.path line below.
-
-What an entry must do:
-  - read every <id>.in in the input directory (the grader runs one case
-    at a time, with only that case's file there):
-    JSON {"schema": "makefun/twitch-ccu-case/v1", "id", "game",
-    "day_start", "checkpoint", "levels", "known", "forecast",
-    "history", "history_hourly", "streams", "categories_hourly",
-    "comparables", "notes"}, where `known` holds hour 1's print
-    {hour: 1, from, until, viewers, channels, reads} and `forecast`
-    lists the hours to forecast, 2..24;
-  - write <id>.out to the output directory: {"hours": [{"hour": 2,
-    "q": [q05, q25, q50, q75, q95]}, ...]}, exactly 23 rows, hours
-    2..24 each once, no other key, each q five finite numbers above 0
-    and at most 1e9 (viewers; fractions allowed), non-decreasing; at
-    most 65,536 bytes. Anything else is an invalid case, scored as if
-    every quantile equalled hour 1's print, and an entry with an invalid
-    case takes no prize.
-
-Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR
-stand in for /input and /output:
-    mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+Validation (leave-one-out over the 28 clean comparables in the kit):
+  mean pinball loss on the log scale, all targets: 0.797 (v1: 0.808)
+  big targets only (hour-1 >= 100k, the GTA VI-like regime): 0.186 (v1: 0.208)
+  mega targets only (hour-1 >= 300k): 0.118 (v1: 0.174)
+  house baseline on the same sets: 1.137 / 0.253 / 0.235.
+The v1 entry scored 0.216 on the server's practice phase (baseline 0.387);
+v2's gain is concentrated in the mega-launch regime, which the practice
+cases (hour-1 prints 23k-270k) do not cover, so the practice score is
+expected to move little while the final-case score should improve.
 """
 
 import json
 import math
 import os
 import statistics
-import sys
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first, so `import model` finds a model.py shipped beside this file.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-# The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
-# The spread of an hour's move, in natural-log units per square-root hour.
-SIGMA = 0.15
-# How much of the comparables' median shape to trust (1.0 = full shape).
-SHAPE = 0.9
-# Size-matching window for the comparable library, as a multiple of the
-# target's hour-1 print.
-SIZE_LO = 0.25
-SIZE_HI = 4.0
-# Library size below which the biggest launches are used instead.
-MIN_LIBRARY = 5
-FALLBACK_TOP = 8
+Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
+MEGA_MIN = 300_000
+KERNEL_SIGMA = 0.6
+SHRINK = 0.9
+MEGA_SPREAD_SCALE = 0.8
+REST_SPREAD_SCALE = 0.75
+SPREAD_MIN = 0.10
+SPREAD_MAX = 0.90
 
 
-def round2(x: float) -> float | int:
-    """x rounded to 2 decimals, half up, as JavaScript's Math.round(x * 100) / 100 rounds it.
-
-    A whole number comes back as an int, so json.dumps writes 1240 where JavaScript writes 1240 (not 1240.0).
-    """
-    scaled = x * 100
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 100
-    return int(value) if value.is_integer() else value
-
-
-def launch_day_hours(comp: dict) -> dict | None:
-    """{hour: viewers} for the comparable's launch day (hours 1..24).
-
-    The hourly series runs from 14 days before the release day to 3 days
-    after it, so the launch day starts at the point whose `from` equals
-    `day_start`. Returns None when the day does not align (the Grand Theft
-    Auto VI pre-release series) or is too short.
-    """
-    hourly = comp.get("hourly") or []
-    start = next((i for i, p in enumerate(hourly) if p.get("from") == comp.get("day_start")), None)
-    if start is None or start + 24 > len(hourly):
-        return None
-    return {h: max(0, hourly[start + h - 1].get("viewers") or 0) for h in range(1, 25)}
-
-
-def usable(comp: dict) -> bool:
-    """True for a comparable whose launch-day shape can be trusted."""
-    if "early-access" in (comp.get("unlock") or ""):
+def is_clean(comp):
+    """A comparable is usable when its launch day is a real launch day."""
+    if "early-access" in comp.get("unlock", ""):
         return False
-    if "before release" in (comp.get("name") or ""):
+    if "before release" in comp.get("name", ""):
         return False
     return True
 
 
-def library(case: dict, p1: float) -> list:
-    """Launch-day hours of the comparables most similar to the target.
+def launch_day_hours(comp):
+    """{hour: viewers} for the comparable's launch day (hours 1..24).
 
-    Size-matched by hour-1 print; when fewer than MIN_LIBRARY match, the
-    FALLBACK_TOP biggest clean comparables are used instead.
+    The launch day starts at the hourly point whose `from` timestamp equals
+    the comparable's `day_start`. Returns None when the day does not align
+    or the data runs out before hour 24.
     """
-    days = []
+    hourly = comp.get("hourly") or []
+    start = comp.get("day_start")
+    idx = next((i for i, p in enumerate(hourly) if p.get("from") == start), None)
+    if idx is None or idx + 24 > len(hourly):
+        return None
+    return {h: max(0, hourly[idx + h - 1].get("viewers", 0)) for h in range(1, 25)}
+
+
+def build_library(case):
+    """Clean comparables with launch-day hours, sorted by name (deterministic)."""
+    lib = []
     for comp in case.get("comparables") or []:
-        if not usable(comp):
+        if not is_clean(comp):
             continue
         day = launch_day_hours(comp)
         if day is None or day[1] < 1:
             continue
-        days.append(day)
-    matched = [d for d in days if SIZE_LO * p1 <= d[1] <= SIZE_HI * p1]
-    if len(matched) >= MIN_LIBRARY:
-        return matched
-    return sorted(days, key=lambda d: -d[1])[:FALLBACK_TOP]
+        lib.append((comp.get("name", ""), day))
+    lib.sort(key=lambda t: t[0])
+    return lib
 
 
-def shape_medians(days: list) -> dict:
-    """Median log-ratio to hour 1 for each forecast hour, over the library."""
-    medians = {}
+def log_ratios(sub, target_name):
+    """Per-hour lists of ln(viewers_h / viewers_1) over a library."""
+    per_hour = {h: [] for h in range(2, 25)}
+    for name, day in sub:
+        if name == target_name:
+            continue
+        p1 = day[1]
+        if p1 < 1:
+            continue
+        for h in range(2, 25):
+            per_hour[h].append(math.log(max(day[h], 1) / p1))
+    return per_hour
+
+
+def medians_of(per_hour):
+    return [statistics.median(per_hour[h]) if per_hour[h] else 0.0
+            for h in range(2, 25)]
+
+
+def weighted_median(vals, weights):
+    pairs = sorted(zip(vals, weights))
+    total = sum(weights)
+    acc = 0.0
+    for value, weight in pairs:
+        acc += weight
+        if acc >= total / 2.0:
+            return value
+    return pairs[-1][0]
+
+
+def weighted_medians(lib, target_name, p1):
+    """Per-hour kernel-weighted median of ln ratios (mega-launch shape)."""
+    lp = math.log(max(p1, 1))
+    per_hour = {h: ([], []) for h in range(2, 25)}
+    for name, day in lib:
+        if name == target_name or day[1] < 1:
+            continue
+        w = math.exp(-0.5 * ((math.log(day[1]) - lp) / KERNEL_SIGMA) ** 2)
+        for h in range(2, 25):
+            per_hour[h][0].append(math.log(max(day[h], 1) / day[1]))
+            per_hour[h][1].append(w)
+    return [weighted_median(*per_hour[h]) if per_hour[h][0] else 0.0
+            for h in range(2, 25)]
+
+
+def smooth_spreads(raw):
+    """3-hour moving average of per-hour spreads (tames small samples)."""
+    sm = []
+    for i in range(23):
+        lo = max(0, i - 1)
+        hi = min(23, i + 2)
+        sm.append(sum(raw[lo:hi]) / (hi - lo))
+    return [min(max(s, SPREAD_MIN), SPREAD_MAX) for s in sm]
+
+
+def empirical_spreads(sub, target_name, scale):
+    """Per-hour std of ln ratios in a library, smoothed and scaled."""
+    per_hour = log_ratios(sub, target_name)
+    raw = []
     for h in range(2, 25):
-        vals = [math.log(max(d[h], 1) / d[1]) for d in days]
-        medians[h] = statistics.median(vals) if vals else 0.0
-    return medians
+        vals = per_hour[h]
+        raw.append(statistics.pstdev(vals) if len(vals) > 1 else 0.15)
+    return smooth_spreads([s * scale for s in raw])
 
 
-def hour_quantiles(p1: float, median_log_ratio: float, h: int) -> list:
-    """The five quantiles of hour h around the shaped median."""
-    spread = min(max(SIGMA * math.sqrt(h - 1), 0.10), 0.90)
-    q50 = p1 * math.exp(SHAPE * median_log_ratio)
-    qs = [round2(q50 * math.exp(z * spread)) for z in Z]
-    qs = [min(max(q, 1), 1_000_000_000) for q in qs]
-    # Keep the row non-decreasing after rounding and clamping.
-    for i in range(1, len(qs)):
-        if qs[i] < qs[i - 1]:
-            qs[i] = qs[i - 1]
-    return qs
+def weighted_spreads(lib, target_name, p1, scale):
+    """Per-hour kernel-weighted std of ln ratios, smoothed and scaled."""
+    lp = math.log(max(p1, 1))
+    per_hour = {h: ([], []) for h in range(2, 25)}
+    for name, day in lib:
+        if name == target_name or day[1] < 1:
+            continue
+        w = math.exp(-0.5 * ((math.log(day[1]) - lp) / KERNEL_SIGMA) ** 2)
+        for h in range(2, 25):
+            per_hour[h][0].append(math.log(max(day[h], 1) / day[1]))
+            per_hour[h][1].append(w)
+    raw = []
+    for h in range(2, 25):
+        vals, ws = per_hour[h]
+        if len(vals) < 2:
+            raw.append(0.15)
+            continue
+        mean = sum(v * w for v, w in zip(vals, ws)) / sum(ws)
+        var = sum(w * (v - mean) ** 2 for v, w in zip(vals, ws)) / sum(ws)
+        raw.append(math.sqrt(var))
+    return smooth_spreads([s * scale for s in raw])
 
 
-def forecast_case(case: dict, name: str) -> dict:
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    first = next((k for k in case["known"] if k["hour"] == 1), None)
-    if first is None:
-        raise ValueError(f"{name} has no hour-1 print")
-    p1 = max(1, first["viewers"])
-    medians = shape_medians(library(case, p1))
-    # The output is always exactly the 23 hours 2..24, whatever the case's
-    # forecast list says: an entry must write those hours and no others.
-    return {"hours": [{"hour": h, "q": hour_quantiles(p1, medians[h], h)} for h in range(2, 25)]}
+def size_matched(lib, p1):
+    """Comparables with hour-1 print in [0.25x, 4x] of the target's."""
+    sized = [(n, d) for n, d in lib if 0.25 * p1 <= d[1] <= 4 * p1]
+    if len(sized) < 5:
+        sized = sorted(lib, key=lambda t: -t[1][1])[:8]
+    return sized
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+def baseline_rows(p1):
+    """House baseline: flat median, spread growing with the hour."""
+    rows = []
+    for h in range(2, 25):
+        s = min(max(0.15 * math.sqrt(h - 1), SPREAD_MIN), SPREAD_MAX)
+        rows.append({"hour": h, "q": quantiles(p1, 0.0, s)})
+    return rows
+
+
+def quantiles(p1, median_log, spread):
+    """Five quantiles around q50 = p1 * exp(median_log)."""
+    q50 = p1 * math.exp(median_log)
+    out = []
+    prev = 0.0
+    for z in Z:
+        q = q50 * math.exp(z * spread)
+        q = float(Decimal(str(q)).quantize(Decimal("0.01"),
+                                            rounding=ROUND_HALF_UP))
+        q = min(max(q, 1.0), 1e9)
+        q = max(q, prev)
+        out.append(q)
+        prev = q
+    return out
+
+
+def forecast_case(case):
+    """Forecast hours 2..24 for one case. Always returns exactly 23 rows."""
+    known = case.get("known") or []
+    p1 = 1
+    if isinstance(known, dict):
+        p1 = max(1, known.get("viewers", 1))
+    else:
+        for row in known:
+            if isinstance(row, dict) and row.get("hour") == 1:
+                p1 = max(1, row.get("viewers", 1))
+                break
+        else:
+            if known and isinstance(known[0], dict):
+                p1 = max(1, known[0].get("viewers", 1))
+    lib = build_library(case)
+    if not lib:
+        return baseline_rows(p1)
+    target_name = case.get("game", {}).get("name", "")
+    if p1 >= MEGA_MIN:
+        meds = weighted_medians(lib, target_name, p1)
+        spreads = weighted_spreads(lib, target_name, p1, MEGA_SPREAD_SCALE)
+    else:
+        sized = size_matched(lib, p1)
+        meds = medians_of(log_ratios(sized, target_name))
+        spreads = empirical_spreads(sized, target_name, REST_SPREAD_SCALE)
+    rows = []
+    for i, h in enumerate(range(2, 25)):
+        rows.append({"hour": h,
+                     "q": quantiles(p1, SHRINK * meds[i], spreads[i])})
+    return rows
+
+
+def main():
+    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for in_path in sorted(input_dir.glob("*.in")):
+        case = json.loads(in_path.read_text())
+        rows = forecast_case(case)
+        out_path = output_dir / (in_path.stem + ".out")
+        out_path.write_text(json.dumps({"hours": rows}))
 
 
 if __name__ == "__main__":
