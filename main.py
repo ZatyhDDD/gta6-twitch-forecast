@@ -191,7 +191,9 @@ def forecast_case(case: dict, name: str) -> dict:
         raise ValueError(f"{name} has no hour-1 print")
     p1 = max(1, first["viewers"])
     medians = shape_medians(library(case, p1))
-    return {"hours": [{"hour": row["hour"], "q": hour_quantiles(p1, medians[row["hour"]], row["hour"])} for row in case["forecast"]]}
+    # The output is always exactly the 23 hours 2..24, whatever the case's
+    # forecast list says: an entry must write those hours and no others.
+    return {"hours": [{"hour": h, "q": hour_quantiles(p1, medians[h], h)} for h in range(2, 25)]}
 
 
 def main() -> None:
